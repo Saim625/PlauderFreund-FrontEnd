@@ -14,8 +14,7 @@ export function useSocket({ onStatus }) {
     };
   }, []);
 
-  const socketUrl =
-    import.meta.env.REACT_APP_SOCKET_URL || "http://localhost:3000";
+  const socketUrl = import.meta.env.REACT_APP_SOCKET_URL;
 
   function connect(url = socketUrl) {
     // Check this URL!
