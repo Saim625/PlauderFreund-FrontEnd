@@ -14,7 +14,7 @@ export function useSocket({ onStatus }) {
     };
   }, []);
 
-  const socketUrl = import.meta.env.REACT_APP_SOCKET_URL;
+  const socketUrl = import.meta.env.VITE_SOCKET_URL;
 
   function connect(url = socketUrl) {
     // Check this URL!
