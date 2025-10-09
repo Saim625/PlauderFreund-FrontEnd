@@ -1,31 +1,3 @@
-// src/utils/pcm-processor.js
-// export class PCMProcessor extends AudioWorkletProcessor {
-//   constructor() {
-//     super();
-//     this.buffer = [];
-//   }
-
-//   process(inputs) {
-//     const input = inputs[0];
-//     if (input.length > 0) {
-//       const channelData = input[0]; // take first channel (mono)
-//       const pcm16 = new Int16Array(channelData.length);
-//       for (let i = 0; i < channelData.length; i++) {
-//         let s = Math.max(-1, Math.min(1, channelData[i]));
-//         pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff; // float → int16
-//       }
-
-//       // Send chunk to main thread
-//       this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
-//     }
-//     return true;
-//   }
-// }
-
-// registerProcessor("pcm-processor", PCMProcessor);
-
-// This code runs in a separate thread (the AudioWorklet)
-
 /**
  * Converts 32-bit floating-point audio data (Float32Array, which is standard
  * for Web Audio) into 16-bit signed integer PCM data (Int16Array, which is

@@ -64,13 +64,30 @@ export function useSocket({ onStatus }) {
     }
   }
 
+  // const endAudio = () => {
+  //   if (socket) {
+  //     socket.emit("audio-end"); // The new explicit event
+  //     console.log("🛑 [FE] Explicit 'audio-end' signal sent to server.");
+  //   }
+  // };
+  // const endAudio = () => {
+  //   const socket = socketRef.current;
+  //   console.log("🟣 endAudio() called in FE"); // Add this
+  //   if (!socket || !socket.connected) {
+  //     console.warn("🛑 [FE] Cannot send audio-end: socket not connected.");
+  //     return;
+  //   }
+  //   socket.emit("audio-end");
+  //   console.log("🛑 [FE] Explicit 'audio-end' signal sent to server.");
+  // };
+
   /**
    * Sends an audio chunk to the backend via the "audio-chunk" socket event.
    * @param {ArrayBuffer} data - Raw 16-bit PCM audio data
    */
   function sendChunk(data) {
     if (socketRef.current && socketRef.current.connected) {
-      // CRITICAL: Emit the data using the agreed-upon event name
+      // Emit ONLY the raw data (ArrayBuffer)
       socketRef.current.emit("audio-chunk", data);
       // Log the transmission for testing Step 3
       console.log(`📤 [FE] Chunk sent: ${data.byteLength} bytes`);

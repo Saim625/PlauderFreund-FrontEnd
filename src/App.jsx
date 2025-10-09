@@ -4,6 +4,7 @@ import Avatar from "./components/Avatar";
 import { useMicrophone } from "./hooks/useMicrophone";
 import { useSocket } from "./hooks/useSocket";
 import { playBlob } from "./utils/audioHelpers";
+import { playPcmBase64Chunk } from "./utils/playPcmBase64";
 
 export default function App() {
   const [stage, setStage] = useState("idle"); // idle | chatting | denied
@@ -11,17 +12,18 @@ export default function App() {
 
   // NOTE: The transcript state has been removed as we only want audio playback.
 
-  // Get necessary controls from useMicrophone (start/stop/pause/resume)
-  const { start, stop, pause, resume } = useMicrophone({
-    onChunk: (pcmBuffer) => {
-      // The VAD inside useMicrophone now ensures chunks are only sent when speaking.
-      sendChunk(pcmBuffer);
-    },
+  // Simplified useSocket: it only needs the status setter and chunk sender.
+  const { connect, sendChunk, endAudio, disconnect } = useSocket({
+    onStatus: setStatusLabel,
   });
 
-  // Simplified useSocket: it only needs the status setter and chunk sender.
-  const { connect, sendChunk, disconnect } = useSocket({
-    onStatus: setStatusLabel,
+  // 2. Update the useMicrophone hook call
+  const { start, stop, pause, resume } = useMicrophone({
+    // Simplified onChunk function since it's a direct passthrough
+    onChunk: sendChunk,
+
+    // CRITICAL: Pass the new socket emitter for the VAD to use
+    // onAudioEnd: endAudio,
   });
 
   const handleStart = async () => {
@@ -51,61 +53,181 @@ export default function App() {
   //   setStatusLabel("");
   // };
 
+  // useEffect(() => {
+  //   const socket = connect();
+
+  //   // 🎧 Listen for GPT’s real-time audio stream
+  //   const audioContext = new AudioContext({ sampleRate: 24000 });
+
+  //   // 🟢 Flag to know when the first chunk starts playing
+  //   let startedPlayback = false;
+
+  //   socket.on("ai-audio-chunk", async (base64Chunk) => {
+  //     if (!startedPlayback) {
+  //       startedPlayback = true;
+  //       await new Promise((r) => setTimeout(r, 150)); // small buffer
+  //     }
+  //     await playPcmBase64Chunk(base64Chunk, audioContext);
+  //   });
+
+  //   socket.on("ai-audio-done", async () => {
+  //     console.log("✅ [FE] AI finished speaking");
+  //     startedPlayback = false; //
+  //     pause();
+  //     setStatusLabel("AI Speaking...");
+
+  //     // wait a small delay then resume mic
+  //     setTimeout(async () => {
+  //       stop();
+  //       await start();
+  //       setStatusLabel("Listening...");
+  //     }, 300);
+  //   });
+
+  //   socket.on("ai-response-done", () => {
+  //     console.log("🧠 [FE] Model response fully complete.");
+  //   });
+
+  //   // 🧠 Error handler
+  //   socket.on("ai-error", ({ message }) => {
+  //     console.error("❌ ai error:", message);
+  //     console.warn("🔄 Resuming mic after STT error (non-timeout).");
+  //     resume();
+  //   });
+
+  //   return () => socket.disconnect();
+  // }, []);
+
   useEffect(() => {
     const socket = connect();
 
-    // Listener for the final audio and text reply from the BE
-    socket.on("audio-reply", async ({ audio, text }) => {
-      console.log(
-        `🔊 [FE] Received audio reply from server: "${text}". Playing...`
-      );
+    // 🎧 Audio setup with proper buffering
+    const audioContext = new AudioContext({ sampleRate: 24000 });
+    let audioQueue = [];
+    let isPlaying = false;
+    let nextStartTime = 0;
+    const MIN_BUFFER_CHUNKS = 2; // Buffer 2 chunks before starting
 
-      // 1️⃣ Pause mic to avoid echo / interference
-      pause();
-      setStatusLabel("AI Speaking...");
+    // 🎵 Play queued audio chunks smoothly
+    const playQueuedAudio = async () => {
+      if (isPlaying || audioQueue.length === 0) return;
 
-      const audioBlob = new Blob([audio], { type: "audio/mp3" });
-
-      try {
-        // 2️⃣ Play AI audio and wait until it's fully finished
-        await playBlob(audioBlob);
-        console.log("✅ Playback finished.");
-
-        // Optional short delay to avoid cutting too close
-        setTimeout(async () => {
-          console.log("🎤 Resuming mic after playback delay...");
-          stop(); // stop existing audio graph completely
-          await start(); // start a fresh one
-          setStatusLabel("Listening...");
-        }, 500);
-      } catch (e) {
-        console.error("❌ Error during audio playback:", e);
-
-        // If playback fails, still recover mic after short delay
-        setTimeout(async () => {
-          stop();
-          await start();
-          setStatusLabel("Listening...");
-        }, 500);
-      }
-    });
-
-    socket.on("stt-error", ({ message }) => {
-      console.error("❌ STT Error from server:", message);
-      // setStatusLabel(`STT Error: ${message.substring(0, 40)}...`);
-
-      // 🔎 Check if it's the ignorable timeout
-      if (message.includes("Audio Timeout Error")) {
-        console.warn("⚠️ Ignoring STT timeout — not resuming mic.");
+      // Wait for minimum buffer before starting
+      if (nextStartTime === 0 && audioQueue.length < MIN_BUFFER_CHUNKS) {
         return;
       }
 
-      // Otherwise, it's a real error, safe to resume
+      isPlaying = true;
+
+      // Ensure audio context is running
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+
+      // Schedule all queued chunks
+      while (audioQueue.length > 0) {
+        const base64Chunk = audioQueue.shift();
+
+        try {
+          // Decode the base64 PCM audio
+          const binaryString = atob(base64Chunk);
+          const bytes = new Uint8Array(binaryString.length);
+          for (let i = 0; i < binaryString.length; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+          }
+
+          // Convert to Int16Array (PCM 16-bit)
+          const pcmData = new Int16Array(bytes.buffer);
+
+          // Create audio buffer
+          const audioBuffer = audioContext.createBuffer(
+            1, // mono
+            pcmData.length,
+            24000
+          );
+
+          // Fill the buffer with PCM data (normalize from int16 to float)
+          const channelData = audioBuffer.getChannelData(0);
+          for (let i = 0; i < pcmData.length; i++) {
+            channelData[i] = pcmData[i] / 32768.0; // normalize int16 to -1.0 to 1.0
+          }
+
+          // Create source and schedule playback
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          source.connect(audioContext.destination);
+
+          // Schedule to play immediately after previous chunk
+          if (nextStartTime === 0) {
+            nextStartTime = audioContext.currentTime;
+          }
+
+          source.start(nextStartTime);
+
+          // Update next start time to avoid gaps
+          nextStartTime += audioBuffer.duration;
+        } catch (error) {
+          console.error("❌ Error playing audio chunk:", error);
+        }
+      }
+
+      isPlaying = false;
+    };
+
+    // 🟢 Receive and queue audio chunks
+    socket.on("ai-audio-chunk", async (base64Chunk) => {
+      audioQueue.push(base64Chunk);
+      playQueuedAudio(); // Try to start/continue playback
+    });
+
+    socket.on("ai-audio-done", async () => {
+      console.log("✅ [FE] AI finished speaking");
+
+      // Wait for all queued audio to finish
+      const remainingDuration = Math.max(
+        0,
+        nextStartTime - audioContext.currentTime
+      );
+
+      await new Promise((r) => setTimeout(r, remainingDuration * 1000 + 300));
+
+      // Reset audio state
+      audioQueue = [];
+      nextStartTime = 0;
+      isPlaying = false;
+
+      pause();
+      setStatusLabel("AI Speaking...");
+
+      // Resume mic
+      setTimeout(async () => {
+        stop();
+        await start();
+        setStatusLabel("Listening...");
+      }, 300);
+    });
+
+    socket.on("ai-response-done", () => {
+      console.log("🧠 [FE] Model response fully complete.");
+    });
+
+    socket.on("ai-error", ({ message }) => {
+      console.error("❌ ai error:", message);
       console.warn("🔄 Resuming mic after STT error (non-timeout).");
+
+      // Clean up audio state on error
+      audioQueue = [];
+      nextStartTime = 0;
+      isPlaying = false;
+
       resume();
     });
 
-    return () => socket.disconnect();
+    // Cleanup
+    return () => {
+      socket.disconnect();
+      audioContext.close();
+    };
   }, []);
 
   return (
