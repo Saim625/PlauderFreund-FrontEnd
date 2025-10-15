@@ -34,14 +34,14 @@ export function useMicrophone({ onChunk }) {
     const isLoud = rms > VAD_THRESHOLD;
 
     // Logging for debugging
-    console.log(
-      "🎧 RMS:",
-      rms.toFixed(5),
-      "| Loud:",
-      isLoud,
-      "| Speaking:",
-      speakingRef.current // Use the Ref here for the log
-    );
+    // console.log(
+    //   "🎧 RMS:",
+    //   rms.toFixed(5),
+    //   "| Loud:",
+    //   isLoud,
+    //   "| Speaking:",
+    //   speakingRef.current // Use the Ref here for the log
+    // );
 
     // CRITICAL: Always send the chunk to prevent server timeouts.
     onChunk(pcm16Buffer);

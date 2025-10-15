@@ -1,35 +1,235 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
 import StartButton from "./components/StartButton";
 import Avatar from "./components/Avatar";
 import { useMicrophone } from "./hooks/useMicrophone";
 import { useSocket } from "./hooks/useSocket";
 import { playBlob } from "./utils/audioHelpers";
-import { playPcmBase64Chunk } from "./utils/playPcmBase64";
 
 export default function App() {
-  const [stage, setStage] = useState("idle"); // idle | chatting | denied
+  const [stage, setStage] = useState("idle");
   const [statusLabel, setStatusLabel] = useState("");
 
-  // NOTE: The transcript state has been removed as we only want audio playback.
+  // Audio playback state
+  const audioContextRef = useRef(null);
+  const audioQueueRef = useRef([]);
+  const isPlayingRef = useRef(false);
+  const nextStartTimeRef = useRef(0);
+  const currentContextIdRef = useRef(null);
+  const activeSourcesRef = useRef([]); // ✅ NEW: Track active audio sources
+  const MIN_BUFFER_CHUNKS = 2;
 
-  // Simplified useSocket: it only needs the status setter and chunk sender.
-  const { connect, sendChunk, endAudio, disconnect } = useSocket({
+  const { connect, sendChunk, disconnect, socketRef } = useSocket({
     onStatus: setStatusLabel,
   });
 
-  // 2. Update the useMicrophone hook call
-  const { start, stop, pause, resume } = useMicrophone({
-    // Simplified onChunk function since it's a direct passthrough
+  const { start, stop } = useMicrophone({
     onChunk: sendChunk,
-
-    // CRITICAL: Pass the new socket emitter for the VAD to use
-    // onAudioEnd: endAudio,
   });
+
+  // ✅ Initialize AudioContext ONCE
+  useEffect(() => {
+    console.log("🎵 Initializing AudioContext");
+    audioContextRef.current = new AudioContext({ sampleRate: 24000 });
+
+    return () => {
+      console.log("🧹 Cleaning up AudioContext on unmount");
+      if (
+        audioContextRef.current &&
+        audioContextRef.current.state !== "closed"
+      ) {
+        audioContextRef.current.close();
+      }
+    };
+  }, []);
+
+  // ✅ NEW: Function to stop all audio immediately
+  const stopAudioPlayback = useCallback(() => {
+    console.log("🛑 [INTERRUPTION] Stopping audio playback");
+
+    // Stop all active audio sources
+    activeSourcesRef.current.forEach((source) => {
+      try {
+        source.stop();
+      } catch (e) {
+        // Already stopped, ignore
+      }
+    });
+    activeSourcesRef.current = [];
+
+    // Clear queue and reset state
+    audioQueueRef.current = [];
+    nextStartTimeRef.current = 0;
+    isPlayingRef.current = false;
+    currentContextIdRef.current = null;
+
+    console.log("✅ [INTERRUPTION] Audio stopped and buffers cleared");
+  }, []);
+
+  // Memoized playback function
+  const playQueuedAudio = useCallback(async () => {
+    const audioContext = audioContextRef.current;
+    const audioQueue = audioQueueRef.current;
+
+    if (!audioContext || audioContext.state === "closed") {
+      console.warn("⚠️ AudioContext not available");
+      return;
+    }
+
+    if (isPlayingRef.current || audioQueue.length === 0) {
+      return;
+    }
+
+    if (
+      nextStartTimeRef.current === 0 &&
+      audioQueue.length < MIN_BUFFER_CHUNKS
+    ) {
+      return;
+    }
+
+    isPlayingRef.current = true;
+
+    if (audioContext.state === "suspended") {
+      await audioContext.resume();
+    }
+
+    console.log(`🎵 Playing ${audioQueue.length} queued chunks`);
+
+    while (audioQueue.length > 0) {
+      const base64Chunk = audioQueue.shift();
+
+      try {
+        const binaryString = atob(base64Chunk);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        const pcmData = new Int16Array(bytes.buffer);
+        const audioBuffer = audioContext.createBuffer(1, pcmData.length, 24000);
+        const channelData = audioBuffer.getChannelData(0);
+        for (let i = 0; i < pcmData.length; i++) {
+          channelData[i] = pcmData[i] / 32768.0;
+        }
+
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
+
+        if (nextStartTimeRef.current === 0) {
+          nextStartTimeRef.current = audioContext.currentTime;
+        }
+
+        source.start(nextStartTimeRef.current);
+        nextStartTimeRef.current += audioBuffer.duration;
+
+        // ✅ NEW: Track active source for interruption
+        activeSourcesRef.current.push(source);
+
+        // ✅ NEW: Remove from tracking when finished
+        source.onended = () => {
+          const index = activeSourcesRef.current.indexOf(source);
+          if (index > -1) {
+            activeSourcesRef.current.splice(index, 1);
+          }
+        };
+      } catch (err) {
+        console.error("❌ Error decoding audio chunk:", err);
+      }
+    }
+
+    isPlayingRef.current = false;
+
+    // Check if more chunks arrived while playing
+    if (audioQueueRef.current.length > 0) {
+      setTimeout(() => playQueuedAudio(), 50);
+    }
+  }, []);
+
+  // ✅ Setup socket listeners ONCE
+  useEffect(() => {
+    const socket = connect();
+
+    console.log("🔌 Setting up socket listeners");
+
+    socket.off("ai-audio-chunk");
+    socket.off("ai-interrupt"); // ✅ NEW
+    socket.off("ai-response-done");
+    socket.off("ai-error");
+
+    // Handle audio chunks
+    socket.on("ai-audio-chunk", (data) => {
+      if (!data?.audio || !data?.contextId) {
+        console.warn("⚠️ Malformed chunk:", data);
+        return;
+      }
+
+      const { contextId, audio, isFinal } = data;
+
+      // If new context, clear old audio queue
+      if (
+        currentContextIdRef.current &&
+        currentContextIdRef.current !== contextId
+      ) {
+        console.log(
+          `🔄 New context detected (${contextId}), clearing old audio`
+        );
+        stopAudioPlayback(); // ✅ Use stop function
+      }
+
+      currentContextIdRef.current = contextId;
+
+      console.log(`🎧 Received chunk for ${contextId} (final: ${isFinal})`);
+      audioQueueRef.current.push(audio);
+      playQueuedAudio();
+
+      // Reset state when stream finishes
+      if (isFinal) {
+        console.log(`🏁 Final chunk for context ${contextId}`);
+        const audioContext = audioContextRef.current;
+
+        if (audioContext && nextStartTimeRef.current > 0) {
+          const remaining = Math.max(
+            0,
+            nextStartTimeRef.current - audioContext.currentTime
+          );
+          setTimeout(() => {
+            console.log("✅ Playback complete, resetting state");
+            audioQueueRef.current = [];
+            nextStartTimeRef.current = 0;
+            currentContextIdRef.current = null;
+            isPlayingRef.current = false;
+            activeSourcesRef.current = []; // ✅ Clear sources
+          }, remaining * 1000 + 300);
+        }
+      }
+    });
+
+    // ✅ NEW: Handle interruption signal from backend
+    socket.on("ai-interrupt", () => {
+      console.log("⚠️ [INTERRUPTION] Received interrupt signal from backend");
+      stopAudioPlayback();
+    });
+
+    socket.on("ai-response-done", (data) => {
+      console.log("✅ AI response complete:", data);
+    });
+
+    socket.on("ai-error", ({ message }) => {
+      console.error("❌ AI Error:", message);
+    });
+
+    return () => {
+      console.log("🧹 Cleaning up socket listeners");
+      socket.off("ai-audio-chunk");
+      socket.off("ai-interrupt");
+      socket.off("ai-response-done");
+      socket.off("ai-error");
+    };
+  }, [connect, playQueuedAudio, stopAudioPlayback]); // ✅ Add stopAudioPlayback
 
   const handleStart = async () => {
     try {
-      connect(); // connect socket
-
+      connect();
       setStage("chatting");
 
       await playBlob(
@@ -38,7 +238,7 @@ export default function App() {
         })
       );
 
-      await start(); // start mic
+      await start();
       setStatusLabel("Listening...");
     } catch (err) {
       console.error("Mic denied:", err);
@@ -46,214 +246,13 @@ export default function App() {
     }
   };
 
-  // const handleStop = () => {
-  //   stop();
-  //   disconnect();
-  //   setStage("idle");
-  //   setStatusLabel("");
-  // };
-
-  // useEffect(() => {
-  //   const socket = connect();
-
-  //   // 🎧 Listen for GPT’s real-time audio stream
-  //   const audioContext = new AudioContext({ sampleRate: 24000 });
-
-  //   // 🟢 Flag to know when the first chunk starts playing
-  //   let startedPlayback = false;
-
-  //   socket.on("ai-audio-chunk", async (base64Chunk) => {
-  //     if (!startedPlayback) {
-  //       startedPlayback = true;
-  //       await new Promise((r) => setTimeout(r, 150)); // small buffer
-  //     }
-  //     await playPcmBase64Chunk(base64Chunk, audioContext);
-  //   });
-
-  //   socket.on("ai-audio-done", async () => {
-  //     console.log("✅ [FE] AI finished speaking");
-  //     startedPlayback = false; //
-  //     pause();
-  //     setStatusLabel("AI Speaking...");
-
-  //     // wait a small delay then resume mic
-  //     setTimeout(async () => {
-  //       stop();
-  //       await start();
-  //       setStatusLabel("Listening...");
-  //     }, 300);
-  //   });
-
-  //   socket.on("ai-response-done", () => {
-  //     console.log("🧠 [FE] Model response fully complete.");
-  //   });
-
-  //   // 🧠 Error handler
-  //   socket.on("ai-error", ({ message }) => {
-  //     console.error("❌ ai error:", message);
-  //     console.warn("🔄 Resuming mic after STT error (non-timeout).");
-  //     resume();
-  //   });
-
-  //   return () => socket.disconnect();
-  // }, []);
-
-  useEffect(() => {
-    const socket = connect();
-
-    // 🎧 Audio setup with proper buffering
-    const audioContext = new AudioContext({ sampleRate: 24000 });
-    let audioQueue = [];
-    let isPlaying = false;
-    let nextStartTime = 0;
-    const MIN_BUFFER_CHUNKS = 2; // Buffer 2 chunks before starting
-
-    // 🎵 Play queued audio chunks smoothly
-    const playQueuedAudio = async () => {
-      if (isPlaying || audioQueue.length === 0) return;
-
-      // Wait for minimum buffer before starting
-      if (nextStartTime === 0 && audioQueue.length < MIN_BUFFER_CHUNKS) {
-        return;
-      }
-
-      isPlaying = true;
-
-      // Ensure audio context is running
-      if (audioContext.state === "suspended") {
-        await audioContext.resume();
-      }
-
-      // Schedule all queued chunks
-      while (audioQueue.length > 0) {
-        const base64Chunk = audioQueue.shift();
-
-        try {
-          // Decode the base64 PCM audio
-          const binaryString = atob(base64Chunk);
-          const bytes = new Uint8Array(binaryString.length);
-          for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
-          }
-
-          // Convert to Int16Array (PCM 16-bit)
-          const pcmData = new Int16Array(bytes.buffer);
-
-          // Create audio buffer
-          const audioBuffer = audioContext.createBuffer(
-            1, // mono
-            pcmData.length,
-            24000
-          );
-
-          // Fill the buffer with PCM data (normalize from int16 to float)
-          const channelData = audioBuffer.getChannelData(0);
-          for (let i = 0; i < pcmData.length; i++) {
-            channelData[i] = pcmData[i] / 32768.0; // normalize int16 to -1.0 to 1.0
-          }
-
-          // Create source and schedule playback
-          const source = audioContext.createBufferSource();
-          source.buffer = audioBuffer;
-          source.connect(audioContext.destination);
-
-          // Schedule to play immediately after previous chunk
-          if (nextStartTime === 0) {
-            nextStartTime = audioContext.currentTime;
-          }
-
-          source.start(nextStartTime);
-
-          // Update next start time to avoid gaps
-          nextStartTime += audioBuffer.duration;
-        } catch (error) {
-          console.error("❌ Error playing audio chunk:", error);
-        }
-      }
-
-      isPlaying = false;
-    };
-
-    // 🟢 Receive and queue audio chunks
-    socket.on("ai-audio-chunk", async (base64Chunk) => {
-      audioQueue.push(base64Chunk);
-      playQueuedAudio(); // Try to start/continue playback
-    });
-
-    socket.on("ai-audio-done", async () => {
-      console.log("✅ [FE] AI finished speaking");
-
-      // Wait for all queued audio to finish
-      const remainingDuration = Math.max(
-        0,
-        nextStartTime - audioContext.currentTime
-      );
-
-      await new Promise((r) => setTimeout(r, remainingDuration * 1000 + 300));
-
-      // Reset audio state
-      audioQueue = [];
-      nextStartTime = 0;
-      isPlaying = false;
-
-      pause();
-      setStatusLabel("AI Speaking...");
-
-      // Resume mic
-      setTimeout(async () => {
-        stop();
-        await start();
-        setStatusLabel("Listening...");
-      }, 300);
-    });
-
-    socket.on("ai-response-done", () => {
-      console.log("🧠 [FE] Model response fully complete.");
-    });
-
-    socket.on("ai-error", ({ message }) => {
-      console.error("❌ ai error:", message);
-      console.warn("🔄 Resuming mic after STT error (non-timeout).");
-
-      // Clean up audio state on error
-      audioQueue = [];
-      nextStartTime = 0;
-      isPlaying = false;
-
-      resume();
-    });
-
-    // Cleanup
-    return () => {
-      socket.disconnect();
-      audioContext.close();
-    };
-  }, []);
-
   return (
     <div className="flex items-center justify-center min-h-screen bg-[#fdfcf7] font-[Inter] p-4">
       {stage === "idle" && <StartButton onStart={handleStart} />}
 
       {stage === "chatting" && (
-        <div className="flex flex-col items-center w-full max-w-md bg-white p-8 rounded-xl shadow-2xl transition-all duration-300">
-          <Avatar status={statusLabel} />
-
-          {/* This area now ONLY shows the status/prompt, no transcript */}
-          <div className="mt-6 text-lg font-medium text-gray-800 text-center min-h-[4rem] flex items-center justify-center">
-            {statusLabel === "Listening..." ? "Speak now..." : statusLabel}
-          </div>
-
-          <div className="mt-4 text-sm text-center text-gray-500">
-            {statusLabel}
-          </div>
-          {/* 
-          <button
-            onClick={handleStop}
-            className="mt-8 px-6 py-3 bg-red-600 text-white font-semibold rounded-full shadow-lg hover:bg-red-700 transition duration-150 transform hover:scale-105 active:scale-95"
-            disabled={statusLabel === "AI Speaking..."}
-          >
-            Stop Chat
-          </button> */}
+        <div>
+          <Avatar />
         </div>
       )}
 
